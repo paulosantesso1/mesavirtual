@@ -41,7 +41,7 @@ Programas NÃO marcados ──► continuam indo para o fone normalmente pelo Wi
 Abra o Prompt de Comando do Desenvolvedor do Visual Studio (procure por "Developer Command Prompt" no menu Iniciar) e execute:
 
 ```
-cl /std:c++17 /O2 /EHsc AudioEngine.cpp /Fe:Placasom.exe Ole32.lib
+cl /std:c++17 /O2 /MT /EHsc AudioEngine.cpp /Fe:Placasom.exe Ole32.lib User32.lib
 ```
 
 Isso gera o arquivo `Placasom.exe`.
@@ -49,7 +49,8 @@ Isso gera o arquivo `Placasom.exe`.
 Se preferir usar o Visual Studio com interface gráfica, crie um projeto do tipo **Console Application (C++)**, adicione o `AudioEngine.cpp`, e nas propriedades do projeto defina:
 
 - C++ Language Standard: C++17 ou superior
-- Em Linker > Input > Additional Dependencies, adicione: `Ole32.lib`
+- Em Linker > Input > Additional Dependencies, adicione: `Ole32.lib;User32.lib`
+- Em C/C++ > Code Generation > Runtime Library, use **Multi-threaded (/MT)** para não depender do Visual C++ Redistributable no PC de destino
 
 ### 2. PlacaGui (a interface — C#)
 

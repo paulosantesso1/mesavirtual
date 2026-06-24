@@ -48,19 +48,15 @@ Name: "desktopicon";   Description: "Criar atalho na Área de Trabalho"; GroupDe
 Name: "startmenuicon"; Description: "Criar atalho no Menu Iniciar";     GroupDescription: "Atalhos:"
 
 [Files]
-; Interface grafica
-Source: "placagui.exe"; DestDir: "{app}"; Flags: ignoreversion
+; Interface grafica publicada (.NET self-contained + arquivos auxiliares)
+Source: "bin\Release\net8.0-windows\win-x64\publish\*"; DestDir: "{app}"; \
+    Excludes: "*.pdb"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 ; Motor de audio (C++)
 Source: "Placasom.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 ; Guia de instrucoes
-Source: "LEIA-ME.txt"; DestDir: "{app}"; Flags: ignoreversion
-
-; Visual C++ Runtime 2022 x64 — provavel causa do icone nao abrir em outras maquinas.
-; Baixe em: https://aka.ms/vs/17/release/vc_redist.x64.exe
-; Coloque na mesma pasta do .iss antes de compilar o instalador.
-Source: "vc_redist.x64.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall
+Source: "README.md"; DestDir: "{app}"; DestName: "LEIA-ME.txt"; Flags: ignoreversion
 
 [Icons]
 ; Menu Iniciar
@@ -78,12 +74,6 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; \
     Tasks: desktopicon
 
 [Run]
-; Instala o Visual C++ Runtime silenciosamente antes de abrir o programa
-Filename: "{tmp}\vc_redist.x64.exe"; \
-    Parameters: "/install /quiet /norestart"; \
-    StatusMsg: "Instalando Visual C++ Runtime..."; \
-    Flags: waituntilterminated
-
 ; Abre o guia de instrucoes (desmarcado por padrao — usuario escolhe)
 Filename: "notepad.exe"; Parameters: "{app}\LEIA-ME.txt"; \
     Description: "Abrir o guia de instruções"; \
@@ -97,7 +87,7 @@ Filename: "{app}\{#AppExeName}"; \
 [UninstallRun]
 ; Encerra os processos antes de desinstalar
 Filename: "taskkill.exe"; Parameters: "/F /IM placagui.exe /IM Placasom.exe"; \
-    Flags: runhidden skipifdoesntexist
+    RunOnceId: "StopMesaDeSomProcesses"; Flags: runhidden skipifdoesntexist
 
 [Code]
 // ============================================================

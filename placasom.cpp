@@ -3,6 +3,7 @@
 #include <iostream>
 #include <vector>
 #include <set>
+#include <algorithm>
 #include <atomic>
 #include <thread>
 #include <mmdeviceapi.h>
@@ -14,6 +15,7 @@
 
 #pragma comment(lib, "Ole32.lib")
 #pragma comment(lib, "mmdevapi.lib")
+#pragma comment(lib, "User32.lib")
 
 #define REFTIMES_PER_SEC 10000000
 const GUID GUID_IEEE_FLOAT = { 0x00000003, 0x0000, 0x0010,
@@ -209,13 +211,18 @@ private:
     std::atomic<float> volMic;
     std::atomic<float> volProc;
     std::atomic<bool>  micAtivo;
+    std::atomic<unsigned long long> droppedMicSamples;
+    std::atomic<unsigned long long> droppedProcSamples;
+    std::atomic<unsigned long long> droppedReturnSamples;
 
-    LockFreeRingBuffer<float>*              bufferMic     = nullptr;
+    LockFreeRingBuffer<float>*              bufferMicMix    = nullptr;
+    LockFreeRingBuffer<float>*              bufferMicReturn = nullptr;
     std::vector<LockFreeRingBuffer<float>*> processBuffers;
     std::atomic<bool>                       isRunning;
     std::thread                             threadMic;
     std::vector<std::thread>                processThreads;
     std::thread                             threadOutput;
+    std::thread                             threadReturn;
 
     bool IsFormatFloat(WAVEFORMATEX* pwfx) {
         if (!pwfx) return false;
@@ -268,7 +275,7 @@ private:
         REFERENCE_TIME defPeriod = 0, minPeriod = 0;
         pAC->GetDevicePeriod(&defPeriod, &minPeriod);
 
-        REFERENCE_TIME candidates[] = { 10000, 30000, 50000, 100000 };
+        REFERENCE_TIME candidates[] = { 30000, 50000, 100000, 200000 };
         for (REFERENCE_TIME dur : candidates) {
             REFERENCE_TIME tryDur = max(dur, minPeriod);
             HRESULT hr = pAC->Initialize(AUDCLNT_SHAREMODE_SHARED,
@@ -288,13 +295,82 @@ private:
     // CaptureMicLoop — captura o microfone fisico.
     // Se micIdx == -1 (desativado), apenas empurra silencio no buffer.
     // -----------------------------------------------------------------------
-    void CaptureMicLoop(int deviceIndex) {
+    WAVEFORMATEX* CreateStereoFloatFormat(UINT32 sampleRate) {
+        auto* pwfx = (WAVEFORMATEX*)CoTaskMemAlloc(sizeof(WAVEFORMATEX));
+        if (!pwfx) return nullptr;
+        ZeroMemory(pwfx, sizeof(WAVEFORMATEX));
+        pwfx->wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
+        pwfx->nChannels = 2;
+        pwfx->nSamplesPerSec = sampleRate;
+        pwfx->wBitsPerSample = 32;
+        pwfx->nBlockAlign = pwfx->nChannels * pwfx->wBitsPerSample / 8;
+        pwfx->nAvgBytesPerSec = pwfx->nSamplesPerSec * pwfx->nBlockAlign;
+        pwfx->cbSize = 0;
+        return pwfx;
+    }
+
+    void EnsureMicBuffers(UINT32 sampleRate) {
+        if (!bufferMicMix)
+            bufferMicMix = new LockFreeRingBuffer<float>(sampleRate * 2 * 2);
+        if (!bufferMicReturn)
+            bufferMicReturn = new LockFreeRingBuffer<float>(sampleRate * 2 * 2);
+    }
+
+    void ReportDroppedSamples(const char* tag,
+                              std::atomic<unsigned long long>& counter,
+                              size_t droppedSamples) {
+        if (droppedSamples == 0) return;
+
+        unsigned long long total = counter.fetch_add(droppedSamples) + droppedSamples;
+        if (total == droppedSamples || (total / 9600ull) != ((total - droppedSamples) / 9600ull)) {
+            std::cerr << "[" << tag << "] amostras descartadas por buffer cheio: "
+                      << total << "\n";
+        }
+    }
+
+    void PushStereoSamples(LockFreeRingBuffer<float>* targetBuffer,
+                           const float* data, size_t sampleCount,
+                           const char* tag,
+                           std::atomic<unsigned long long>& droppedCounter) {
+        if (!targetBuffer || !data || sampleCount == 0) return;
+
+        size_t writable = targetBuffer->GetAvailableWrite();
+        writable -= (writable % 2);
+
+        size_t toWrite = (sampleCount < writable) ? sampleCount : writable;
+        toWrite -= (toWrite % 2);
+
+        if (toWrite > 0)
+            targetBuffer->Push(data, toWrite);
+
+        ReportDroppedSamples(tag, droppedCounter, sampleCount - toWrite);
+    }
+
+    void PopStereoSamples(LockFreeRingBuffer<float>* sourceBuffer, float& left, float& right,
+                          std::atomic<unsigned long long>* underflowCounter,
+                          const char* tag) {
+        left = 0.0f;
+        right = 0.0f;
+        if (!sourceBuffer) return;
+
+        float pair[2] = { 0.0f, 0.0f };
+        if (sourceBuffer->Pop(pair, 2)) {
+            left = pair[0];
+            right = pair[1];
+            return;
+        }
+
+        if (underflowCounter)
+            ReportDroppedSamples(tag, *underflowCounter, 2);
+    }
+
+    void CaptureMicLoop(int deviceIndex, UINT32 outputSampleRate) {
         if (FAILED(CoInitializeEx(NULL, COINIT_MULTITHREADED))) return;
 
         // Mic desativado: aloca buffer com taxa padrao e nao captura nada.
         // O MixerLoop vai ler silencio (Pop retorna false → 0.0f).
         if (deviceIndex < 0) {
-            bufferMic = new LockFreeRingBuffer<float>(48000 * 2 * 2);
+            EnsureMicBuffers(outputSampleRate);
             while (isRunning) Sleep(100);
             CoUninitialize();
             return;
@@ -302,20 +378,22 @@ private:
 
         IMMDevice* pDevice = GetDeviceByIndex(eCapture, deviceIndex);
         if (!pDevice) {
-            bufferMic = new LockFreeRingBuffer<float>(48000 * 2 * 2);
+            EnsureMicBuffers(outputSampleRate);
             while (isRunning) Sleep(100);
             CoUninitialize(); return;
         }
 
         IAudioClient*        pAC  = nullptr;
         IAudioCaptureClient* pCC  = nullptr;
-        WAVEFORMATEX*        pwfx = nullptr;
+        WAVEFORMATEX*        nativePwfx = nullptr;
+        WAVEFORMATEX*        capturePwfx = nullptr;
         HANDLE               hEv  = NULL;
 
         auto Cleanup = [&]() {
             if (pAC)  { pAC->Stop(); pAC->Release(); }
             if (pCC)    pCC->Release();
-            if (pwfx)   CoTaskMemFree(pwfx);
+            if (nativePwfx)  CoTaskMemFree(nativePwfx);
+            if (capturePwfx) CoTaskMemFree(capturePwfx);
             if (hEv)    CloseHandle(hEv);
             pDevice->Release();
             CoUninitialize();
@@ -323,31 +401,38 @@ private:
 
         if (FAILED(pDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL,
                                      NULL, (void**)&pAC)))
-            { bufferMic = new LockFreeRingBuffer<float>(48000*2*2); Cleanup(); return; }
+            { EnsureMicBuffers(outputSampleRate); Cleanup(); return; }
 
-        pAC->GetMixFormat(&pwfx);
-        bool   isFloat    = IsFormatFloat(pwfx);
-        WORD   bits       = pwfx->wBitsPerSample;
-        UINT32 ch         = pwfx->nChannels;
-        UINT32 sampleRate = pwfx->nSamplesPerSec;
+        if (FAILED(pAC->GetMixFormat(&nativePwfx)) || !nativePwfx)
+            { EnsureMicBuffers(outputSampleRate); Cleanup(); return; }
 
-        std::cout << "[Mic] Taxa: " << sampleRate << " Hz, "
-                  << ch << " canal(is), " << bits << " bits\n";
+        std::cout << "[Mic] Nativo: " << nativePwfx->nSamplesPerSec << " Hz, "
+                  << nativePwfx->nChannels << " canal(is), "
+                  << nativePwfx->wBitsPerSample << " bits\n";
 
-        // Buffer proporcional à taxa real do microfone (2 segundos)
-        bufferMic = new LockFreeRingBuffer<float>(sampleRate * 2 * 2);
+        capturePwfx = CreateStereoFloatFormat(outputSampleRate);
+        if (!capturePwfx)
+            { EnsureMicBuffers(outputSampleRate); Cleanup(); return; }
+
+        EnsureMicBuffers(outputSampleRate);
 
         REFERENCE_TIME dur = 0;
-        if (FAILED(InitializeWithMinLatency(pAC, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                                            pwfx, &dur)))
-            { delete bufferMic; bufferMic = nullptr; Cleanup(); return; }
+        if (FAILED(InitializeWithMinLatency(pAC,
+                                            AUDCLNT_STREAMFLAGS_EVENTCALLBACK |
+                                            AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
+                                            AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+                                            capturePwfx, &dur)))
+            { Cleanup(); return; }
 
         hEv = CreateEvent(NULL, FALSE, FALSE, NULL);
-        if (!hEv) { delete bufferMic; bufferMic = nullptr; Cleanup(); return; }
+        if (!hEv) { Cleanup(); return; }
 
         pAC->SetEventHandle(hEv);
         pAC->GetService(__uuidof(IAudioCaptureClient), (void**)&pCC);
         pAC->Start();
+
+        std::cout << "[Mic] Captura convertida para " << outputSampleRate
+                  << " Hz, 2 canais, float32\n";
 
         std::vector<float> tmp;
         while (isRunning) {
@@ -357,17 +442,17 @@ private:
             while (pktLen != 0) {
                 BYTE* pData; UINT32 nFrames; DWORD flags;
                 if (SUCCEEDED(pCC->GetBuffer(&pData, &nFrames, &flags, NULL, NULL))) {
-                    if (!(flags & AUDCLNT_BUFFERFLAGS_SILENT) && micAtivo.load()) {
-                        float vMic = volMic.load();
+                    if (!(flags & AUDCLNT_BUFFERFLAGS_SILENT)) {
                         tmp.resize(nFrames * 2);
                         for (UINT32 i = 0; i < nFrames; ++i) {
-                            float L = LeAmostra(pData, i, ch, 0, bits, isFloat) * vMic;
-                            float R = (ch > 1)
-                                ? LeAmostra(pData, i, ch, 1, bits, isFloat) * vMic
-                                : L;
+                            float L = ((float*)pData)[i*2];
+                            float R = ((float*)pData)[i*2+1];
                             tmp[i*2] = L; tmp[i*2+1] = R;
                         }
-                        if (bufferMic) bufferMic->Push(tmp.data(), nFrames * 2);
+                        PushStereoSamples(bufferMicMix, tmp.data(), nFrames * 2,
+                                          "Mic->Mix", droppedMicSamples);
+                        PushStereoSamples(bufferMicReturn, tmp.data(), nFrames * 2,
+                                          "Mic->Return", droppedReturnSamples);
                     }
                     pCC->ReleaseBuffer(nFrames);
                 }
@@ -405,8 +490,8 @@ private:
 
         AUDIOCLIENT_ACTIVATION_PARAMS params = {};
         params.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
-        // EXCLUDE: captura apenas o processo especifico, sem filhos.
-        // Evita capturar processos filhos como TeamTalk quando o pai e o NVDA.
+        // INCLUDE_TARGET_PROCESS_TREE captura o processo-alvo e seus filhos.
+        // Isso cobre navegadores e apps que reproduzem audio em subprocessos.
         params.ProcessLoopbackParams.ProcessLoopbackMode =
             PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE;
         params.ProcessLoopbackParams.TargetProcessId = ctx->targetPid;
@@ -551,15 +636,15 @@ private:
                 BYTE* pData; UINT32 nFrames; DWORD flags;
                 if (SUCCEEDED(pCC->GetBuffer(&pData, &nFrames, &flags, NULL, NULL))) {
                     if (!(flags & AUDCLNT_BUFFERFLAGS_SILENT)) {
-                        float vProc = volProc.load();
                         tmp.resize(nFrames * 2);
                         for (UINT32 i = 0; i < nFrames; ++i) {
                             // Formato e sempre float32 stereo apos AUTOCONVERT
-                            float L = ((float*)pData)[i*2]   * vProc;
-                            float R = ((float*)pData)[i*2+1] * vProc;
+                            float L = ((float*)pData)[i*2];
+                            float R = ((float*)pData)[i*2+1];
                             tmp[i*2] = L; tmp[i*2+1] = R;
                         }
-                        targetBuffer->Push(tmp.data(), nFrames * 2);
+                        PushStereoSamples(targetBuffer, tmp.data(), nFrames * 2,
+                                          "ProcCapture", droppedProcSamples);
                     }
                     pCC->ReleaseBuffer(nFrames);
                 }
@@ -572,7 +657,7 @@ private:
     // -----------------------------------------------------------------------
     // InitializeRender
     // -----------------------------------------------------------------------
-    AudioNode InitializeRender(IMMDevice* pDevice) {
+    AudioNode InitializeRender(IMMDevice* pDevice, UINT32 outputSampleRate) {
         AudioNode node;
         if (!pDevice) return node;
         struct Guard { IMMDevice* d; ~Guard() { if(d) d->Release(); } } g{pDevice};
@@ -581,10 +666,16 @@ private:
                                      NULL, (void**)&node.client)))
             return node;
 
-        node.client->GetMixFormat(&node.format);
+        node.format = CreateStereoFloatFormat(outputSampleRate);
+        if (!node.format) {
+            node.client->Release(); node.client = nullptr;
+            return node;
+        }
         REFERENCE_TIME dur = 0;
         if (FAILED(InitializeWithMinLatency(node.client,
-                                            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                                            AUDCLNT_STREAMFLAGS_EVENTCALLBACK |
+                                            AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
+                                            AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
                                             node.format, &dur))) {
             node.client->Release(); node.client = nullptr;
             CoTaskMemFree(node.format); node.format = nullptr;
@@ -626,32 +717,18 @@ private:
         return rate;
     }
 
-    // -----------------------------------------------------------------------
-    // MixerLoop — CORRECAO DE CORTES:
-    // O retorno fisico (fone) estava cortando porque o MixerLoop usava apenas
-    // o evento do cabo virtual para acordar. Quando o cabo virtual esta cheio
-    // mas o retorno fisico precisa de dados, o retorno fica sem audio.
-    // Correcao: o retorno fisico recebe dados no mesmo ciclo do cabo virtual,
-    // mas com verificacao de padding independente. Alem disso, o buffer foi
-    // aumentado para 20ms para absorver jitter entre os dois dispositivos.
-    // -----------------------------------------------------------------------
-    void MixerLoop(int virtualIdx, int physicalIdx) {
+    void MixerLoop(int virtualIdx, UINT32 outputSampleRate) {
         CoInitializeEx(NULL, COINIT_MULTITHREADED);
 
-        AudioNode outVirt = InitializeRender(GetDeviceByIndex(eRender, virtualIdx));
-        AudioNode outPhys = InitializeRender(GetDeviceByIndex(eRender, physicalIdx));
+        AudioNode outVirt = InitializeRender(GetDeviceByIndex(eRender, virtualIdx),
+                                             outputSampleRate);
 
         if (outVirt.client) outVirt.client->Start();
-        if (outPhys.client) outPhys.client->Start();
 
         bool   vFloat = outVirt.client ? IsFormatFloat(outVirt.format) : false;
         WORD   vBits  = outVirt.client ? outVirt.format->wBitsPerSample : 0;
         UINT32 vCh    = outVirt.client ? outVirt.format->nChannels      : 0;
-        UINT32 vRate  = outVirt.client ? outVirt.format->nSamplesPerSec : 48000;
-
-        bool   pFloat = outPhys.client ? IsFormatFloat(outPhys.format) : false;
-        WORD   pBits  = outPhys.client ? outPhys.format->wBitsPerSample : 0;
-        UINT32 pCh    = outPhys.client ? outPhys.format->nChannels      : 0;
+        UINT32 vRate  = outVirt.client ? outVirt.format->nSamplesPerSec : outputSampleRate;
 
         std::cout << "[Mixer] Virtual: " << vCh << "ch, " << vBits
                   << "bit, " << vRate << "Hz\n";
@@ -661,39 +738,35 @@ private:
 
             if (WaitForSingleObject(outVirt.hEvent, 2000) == WAIT_TIMEOUT) continue;
 
-            // Le padding dos dois dispositivos antes de escrever
-            UINT32 padV = 0, padP = 0;
+            UINT32 padV = 0;
             if (outVirt.client) outVirt.client->GetCurrentPadding(&padV);
-            if (outPhys.client) outPhys.client->GetCurrentPadding(&padP);
             UINT32 framesV = outVirt.bufferSize - padV;
-            UINT32 framesP = outPhys.client ? (outPhys.bufferSize - padP) : 0;
-
-            // Usa o menor numero de frames para nao consumir mais do buffer
-            // do que os dois dispositivos conseguem absorver simultaneamente.
-            // Isso elimina o underrun que causava os cortes no retorno.
             UINT32 frames = framesV;
 
             BYTE*   pDataV = nullptr; HRESULT hrV = E_FAIL;
-            BYTE*   pDataP = nullptr; HRESULT hrP = E_FAIL;
             if (frames > 0 && outVirt.render)
                 hrV = outVirt.render->GetBuffer(frames, &pDataV);
-            if (framesP > 0 && outPhys.render)
-                hrP = outPhys.render->GetBuffer(framesP, &pDataP);
 
             float vM = volMic.load();
             float vP = volProc.load();
 
             for (UINT32 i = 0; i < frames; ++i) {
-                // Le mic UMA vez por frame — mesmo valor vai para cabo e retorno
                 float micL = 0.0f, micR = 0.0f;
-                if (bufferMic) { bufferMic->Pop(&micL, 1); bufferMic->Pop(&micR, 1); }
-                micL *= vM; micR *= vM;
+                PopStereoSamples(bufferMicMix, micL, micR, nullptr, "MicMixRead");
+                if (micAtivo.load()) {
+                    micL *= vM;
+                    micR *= vM;
+                } else {
+                    micL = 0.0f;
+                    micR = 0.0f;
+                }
 
                 float sumL = 0.0f, sumR = 0.0f;
                 for (auto buf : processBuffers) {
                     float pL = 0.0f, pR = 0.0f;
-                    if (buf->Pop(&pL, 1) && buf->Pop(&pR, 1))
-                        { sumL += pL * vP; sumR += pR * vP; }
+                    PopStereoSamples(buf, pL, pR, nullptr, "ProcMixRead");
+                    sumL += pL * vP;
+                    sumR += pR * vP;
                 }
 
                 // Cabo virtual = mic + processos
@@ -702,29 +775,61 @@ private:
                     if (vCh > 1)
                         EscreveAmostra(pDataV, i, vCh, 1, vBits, vFloat, Clamp(micR + sumR));
                 }
-
-                // Retorno fisico = so mic (sem eco dos processos no fone)
-                // Usa o mesmo micL/micR ja lido — nao consome bufferMic de novo
-                if (SUCCEEDED(hrP) && pDataP && i < framesP) {
-                    EscreveAmostra(pDataP, i, pCh, 0, pBits, pFloat, micL);
-                    if (pCh > 1)
-                        EscreveAmostra(pDataP, i, pCh, 1, pBits, pFloat, micR);
-                }
             }
-
-            // Se retorno tem mais frames que o cabo, preenche com silencio
-            for (UINT32 i = frames; i < framesP; ++i) {
-                if (SUCCEEDED(hrP) && pDataP) {
-                    EscreveAmostra(pDataP, i, pCh, 0, pBits, pFloat, 0.0f);
-                    if (pCh > 1) EscreveAmostra(pDataP, i, pCh, 1, pBits, pFloat, 0.0f);
-                }
-            }
-
             if (SUCCEEDED(hrV) && outVirt.render) outVirt.render->ReleaseBuffer(frames, 0);
-            if (SUCCEEDED(hrP) && outPhys.render) outPhys.render->ReleaseBuffer(framesP, 0);
         }
 
         ReleaseAudioNode(outVirt);
+        CoUninitialize();
+    }
+
+    void ReturnLoop(int physicalIdx, UINT32 outputSampleRate) {
+        if (physicalIdx < 0) return;
+        CoInitializeEx(NULL, COINIT_MULTITHREADED);
+
+        AudioNode outPhys = InitializeRender(GetDeviceByIndex(eRender, physicalIdx),
+                                             outputSampleRate);
+        if (outPhys.client) outPhys.client->Start();
+
+        bool   pFloat = outPhys.client ? IsFormatFloat(outPhys.format) : false;
+        WORD   pBits  = outPhys.client ? outPhys.format->wBitsPerSample : 0;
+        UINT32 pCh    = outPhys.client ? outPhys.format->nChannels : 0;
+
+        while (isRunning) {
+            if (!outPhys.hEvent) break;
+            if (WaitForSingleObject(outPhys.hEvent, 2000) == WAIT_TIMEOUT) continue;
+
+            UINT32 padP = 0;
+            if (outPhys.client) outPhys.client->GetCurrentPadding(&padP);
+            UINT32 framesP = outPhys.bufferSize - padP;
+
+            BYTE* pDataP = nullptr;
+            HRESULT hrP = E_FAIL;
+            if (framesP > 0 && outPhys.render)
+                hrP = outPhys.render->GetBuffer(framesP, &pDataP);
+
+            float vM = volMic.load();
+            for (UINT32 i = 0; i < framesP; ++i) {
+                float micL = 0.0f, micR = 0.0f;
+                PopStereoSamples(bufferMicReturn, micL, micR, nullptr, "MicReturnRead");
+                if (micAtivo.load()) {
+                    micL *= vM;
+                    micR *= vM;
+                } else {
+                    micL = 0.0f;
+                    micR = 0.0f;
+                }
+
+                if (SUCCEEDED(hrP) && pDataP) {
+                    EscreveAmostra(pDataP, i, pCh, 0, pBits, pFloat, Clamp(micL));
+                    if (pCh > 1)
+                        EscreveAmostra(pDataP, i, pCh, 1, pBits, pFloat, Clamp(micR));
+                }
+            }
+
+            if (SUCCEEDED(hrP) && outPhys.render) outPhys.render->ReleaseBuffer(framesP, 0);
+        }
+
         ReleaseAudioNode(outPhys);
         CoUninitialize();
     }
@@ -732,7 +837,8 @@ private:
 public:
     AudioEngine()
         : volMic(1.0f), volProc(1.0f), micAtivo(true),
-          bufferMic(nullptr), isRunning(false) {}
+          droppedMicSamples(0), droppedProcSamples(0), droppedReturnSamples(0),
+          bufferMicMix(nullptr), bufferMicReturn(nullptr), isRunning(false) {}
     ~AudioEngine() { Stop(); }
 
     // Metodos para ajuste de volume em tempo real (chamados pelo main apos Start)
@@ -775,11 +881,13 @@ public:
         std::cout << "\nMesa de Som v3.0 iniciando...\n";
         std::cout << "Vol mic=" << vMic << " vol proc=" << vProc << "\n";
 
-        threadMic    = std::thread(&AudioEngine::CaptureMicLoop, this, micIdx);
-        threadOutput = std::thread(&AudioEngine::MixerLoop, this, virtualIdx, foneIdx);
-
         UINT32 outRate = GetDeviceSampleRate(virtualIdx);
         std::cout << "[Start] Taxa do cabo virtual: " << outRate << " Hz\n";
+
+        threadMic    = std::thread(&AudioEngine::CaptureMicLoop, this, micIdx, outRate);
+        threadOutput = std::thread(&AudioEngine::MixerLoop, this, virtualIdx, outRate);
+        if (foneIdx >= 0)
+            threadReturn = std::thread(&AudioEngine::ReturnLoop, this, foneIdx, outRate);
 
         for (DWORD pid : pids) {
             // Resolve o PID correto de audio antes de ativar
@@ -809,12 +917,42 @@ public:
         if (threadMic.joinable())    threadMic.join();
         for (auto& t : processThreads) { if (t.joinable()) t.join(); }
         if (threadOutput.joinable()) threadOutput.join();
-        delete bufferMic; bufferMic = nullptr;
+        if (threadReturn.joinable()) threadReturn.join();
+        delete bufferMicMix; bufferMicMix = nullptr;
+        delete bufferMicReturn; bufferMicReturn = nullptr;
         for (auto buf : processBuffers) delete buf;
         processBuffers.clear();
         processThreads.clear();
     }
 };
+
+static void ProcessCommand(const std::string& raw, AudioEngine& engine) {
+    auto start = raw.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) return;
+
+    auto end = raw.find_last_not_of(" \t\r\n");
+    std::string cmd = raw.substr(start, end - start + 1);
+
+    if (cmd == "stop" || cmd == "exit" || cmd == "quit") {
+        engine.Stop();
+        return;
+    }
+
+    auto sep = cmd.find(':');
+    if (sep == std::string::npos || sep == 0 || sep + 1 >= cmd.size()) return;
+
+    std::string key = cmd.substr(0, sep);
+    std::string value = cmd.substr(sep + 1);
+
+    try {
+        float percent = std::stof(value);
+        float normalized = percent / 100.0f;
+        if (key == "mic") engine.SetVolMic(normalized);
+        else if (key == "proc") engine.SetVolProc(normalized);
+    }
+    catch (...) {
+    }
+}
 
 // ---------------------------------------------------------------------------
 // main — argumentos: micIdx caboIdx foneIdx volMic volProc PID1 [PID2 ...]
@@ -844,8 +982,21 @@ int main(int argc, char* argv[]) {
                 pids.push_back(std::stoul(argv[i]));
 
             engine.Start(micIdx, caboIdx, foneIdx, pids, vMic, vProc);
-            std::cout << "Mesa de som rodando. ENTER para parar.\n";
-            std::cin.get();
+            std::cout << "Mesa de som rodando. Envie 'stop' no stdin para parar.\n";
+
+            std::string line;
+            while (std::getline(std::cin, line)) {
+                auto trimmedStart = line.find_first_not_of(" \t\r\n");
+                if (trimmedStart == std::string::npos) continue;
+
+                std::string command = line.substr(trimmedStart);
+                if (command == "stop" || command == "exit" || command == "quit") {
+                    break;
+                }
+
+                ProcessCommand(command, engine);
+            }
+
             engine.Stop();
             CoUninitialize();
             return 0;

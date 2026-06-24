@@ -202,6 +202,8 @@ namespace placagui
             };
         }
 
+        void InitializeComponent() { }
+
         // ── Bandeja ───────────────────────────────────────────────────────────
         void BuildTray()
         {
@@ -576,10 +578,20 @@ namespace placagui
             if (motor != null) {
                 try {
                     if (!motor.HasExited) {
-                        motor.Kill();
-                        motor.WaitForExit(2000); // aguarda terminar de verdade
+                        if (motor.StartInfo.RedirectStandardInput) {
+                            motor.StandardInput.WriteLine("stop");
+                            motor.StandardInput.Close();
+                        }
+                        if (!motor.WaitForExit(2000)) {
+                            motor.Kill();
+                            motor.WaitForExit(2000); // fallback caso o motor nao responda
+                        }
                     }
-                } catch { }
+                } catch (InvalidOperationException) {
+                    if (!motor.HasExited) motor.Kill();
+                } catch (IOException) {
+                    if (!motor.HasExited) motor.Kill();
+                }
                 motor.Dispose();
                 motor = null;
             }
